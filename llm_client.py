@@ -1,5 +1,4 @@
 import os
-from typing import Optional
 
 
 class MockClient:
@@ -48,9 +47,12 @@ class GeminiClient:
         """
         try:
             merged_prompt = f"{system_prompt}\n\n{user_prompt}".strip()
+            from google.genai import types
+
             response = self.client.models.generate_content(
                 model=self.model_name,
                 contents=merged_prompt,
+                config=types.GenerateContentConfig(temperature=self.temperature),
             )
 
             # Defensive: response.text can be None or raise an error if blocked by filters.

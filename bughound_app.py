@@ -4,7 +4,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from bughound_agent import BugHoundAgent
-from llm_client import GeminiClient, MockClient
+from llm_client import GeminiClient
 
 # ----------------------------
 # App setup
@@ -82,7 +82,7 @@ mode = st.sidebar.selectbox(
     help="Heuristic mode runs fully offline. Gemini mode calls the Gemini API for analysis and fix proposal.",
 )
 
-# [cite_start]UPDATED: Added a warning for free-tier users to manage expectations regarding API limits. [cite: 176, 192]
+# UPDATED: Added a warning for free-tier users to manage expectations regarding API limits.
 if mode == "Gemini (requires API key)":
     st.sidebar.warning("⚠️ Gemini Free Tier: You have a limit of ~20 requests. Use Heuristic mode for initial testing to save your quota.")
 
@@ -118,16 +118,23 @@ client = None
 client_status = ""
 
 if mode == "Heuristic only (no API)":
-    client = MockClient()
-    client_status = "Using MockClient. No network calls."
+    # No client at all: the agent runs its deterministic heuristic analyzer/fixer
+    # and the trace says so (MockClient would make the trace claim an LLM was used).
+    client = None
+    client_status = "Heuristic rules only. No network calls."
 else:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
         client = None
         client_status = "Missing GEMINI_API_KEY. Add it to your .env file to use Gemini mode."
     else:
-        client = GeminiClient(model_name=model_name, temperature=temperature)
-        client_status = "Gemini client ready."
+        try:
+            client = GeminiClient(model_name=model_name, temperature=temperature)
+            client_status = "Gemini client ready."
+        except Exception as e:  # e.g. google-genai missing; never show the key
+            client = None
+            client_status = f"Could not start Gemini client ({type(e).__name__}). Use Heuristic mode."
+            st.sidebar.error(client_status)
 
 st.sidebar.info(client_status)
 
@@ -222,7 +229,17 @@ if run_button:
 
     st.divider()
 
-    # [cite_start]UPDATED: Check if a fallback occurred due to API limits/errors and notify the user. [cite: 119, 128]
+    if mode == "Gemini (requires API key)":
+        if result.get("analysis_source") == "llm":
+            st.info(f"Analysis by Gemini ({model_name}); fix by "
+                    f"{'Gemini' if result.get('fix_source') == 'llm' else 'heuristic rules (fallback)'}.")
+        else:
+            st.warning("Gemini was selected, but its output was unusable or the call failed. "
+                       "These results come from heuristic rules. See the agent trace for the reason.")
+    else:
+        st.caption("Analysis and fix by heuristic rules (no AI used).")
+
+    # UPDATED: Check if a fallback occurred due to API limits/errors and notify the user.
     if any("API Error" in log.get("message", "") for log in logs):
         st.warning("⚠️ API Request Failed: BugHound hit a limit or network error and used heuristic rules instead.")
 

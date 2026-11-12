@@ -59,7 +59,7 @@ In the sidebar, select:
 
 * **Model mode:** Heuristic only (no API)
 
-This mode uses simple pattern-based rules and is useful for testing the workflow without network access.
+This mode runs no AI at all (the trace says so). It uses simple pattern-based rules and is useful for testing the workflow without network access.
 
 ---
 
@@ -92,6 +92,10 @@ In the sidebar, select:
 
 BugHound will now use Gemini for analysis and fix generation, while still applying local reliability checks.
 
+If Gemini's reply is empty, invalid or the call fails, BugHound falls back to its heuristic rules. The app tells you when that happens, and the **Agent trace** shows the reason. `.env` is git-ignored; never commit your key.
+
+> Status: Gemini mode has only been tested with mocked responses so far. Run at least two sample snippets in Gemini mode yourself and record what you see in `model_card.md` (section F).
+
 ---
 
 ## Running Tests
@@ -99,11 +103,14 @@ BugHound will now use Gemini for analysis and fix generation, while still applyi
 Tests focus on **reliability logic** and **agent behavior**, not the UI.
 
 ```bash
-pytest
+python -m pytest -q
 ```
+
+(If pytest complains about a `setup.cfg` in a parent folder, run `python -m pytest -q -c /dev/null --rootdir=.`.)
 
 You should see tests covering:
 
-* Risk scoring and guardrails
+* Risk scoring and guardrails (signature changes, syntax-validity hard block)
+* Strict validation of LLM analyzer output
 * Heuristic fallbacks when LLM output is invalid
 * End-to-end agent workflow shape

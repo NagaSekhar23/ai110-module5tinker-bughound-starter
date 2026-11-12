@@ -9,6 +9,11 @@ from reliability.risk_assessor import assess_risk
 PROMPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts")
 
 
+# Analyzer output validation rules (see _validate_issues)
+VALID_SEVERITIES = {"Low", "Medium", "High"}
+MIN_MSG_LENGTH = 5
+
+
 def _load_prompt(filename: str) -> str:
     """Load a prompt template from the prompts/ folder."""
     path = os.path.join(PROMPTS_DIR, filename)
@@ -31,12 +36,19 @@ class BugHoundAgent:
         # client should implement: complete(system_prompt: str, user_prompt: str) -> str
         self.client = client
         self.logs: List[Dict[str, str]] = []
+        # Which engine actually produced the result: "llm" or "heuristic".
+        # Updated by analyze()/propose_fix() so the UI never claims AI was used
+        # when the agent fell back.
+        self.analysis_source = "heuristic"
+        self.fix_source = "heuristic"
 
     # ----------------------------
     # Public API
     # ----------------------------
     def run(self, code_snippet: str) -> Dict[str, Any]:
         self.logs = []
+        self.analysis_source = "heuristic"
+        self.fix_source = "heuristic"
         self._log("PLAN", "Planning a quick scan + fix proposal workflow.")
 
         issues = self.analyze(code_snippet)
@@ -49,6 +61,10 @@ class BugHoundAgent:
         risk = assess_risk(original_code=code_snippet, fixed_code=fixed_code, issues=issues)
         self._log("TEST", f"Risk assessed as {risk.get('level', 'unknown')} (score={risk.get('score', '-')}).")
 
+        # Make any hard guardrail block visible in the trace, not just the risk report.
+        for blocked in risk.get("guardrail_blocks", []):
+            self._log("TEST", f"GUARDRAIL: {blocked}")
+
         if risk.get("should_autofix"):
             self._log("REFLECT", "Fix appears safe enough to auto-apply under current policy.")
         else:
@@ -59,6 +75,8 @@ class BugHoundAgent:
             "fixed_code": fixed_code,
             "risk": risk,
             "logs": self.logs,
+            "analysis_source": self.analysis_source,
+            "fix_source": self.fix_source,
         }
 
     # ----------------------------
@@ -83,12 +101,14 @@ class BugHoundAgent:
             self._log("ANALYZE", f"API Error: {str(e)}. Falling back to heuristics.")
             return self._heuristic_analyze(code_snippet)
 
-        issues = self._parse_json_array_of_issues(raw)
+        issues, reason = self._parse_and_validate_issues(raw)
 
         if issues is None:
-            self._log("ANALYZE", "LLM output was not parseable JSON. Falling back to heuristics.")
+            # Record *why* the output was rejected so the trace is debuggable.
+            self._log("ANALYZE", f"LLM output rejected ({reason}). Falling back to heuristics.")
             return self._heuristic_analyze(code_snippet)
 
+        self.analysis_source = "llm"
         return issues
 
     def propose_fix(self, code_snippet: str, issues: List[Dict[str, str]]) -> str:
@@ -120,6 +140,7 @@ class BugHoundAgent:
             self._log("ACT", "LLM returned empty output. Falling back to heuristic fixer.")
             return self._heuristic_fix(code_snippet, issues)
 
+        self.fix_source = "llm"
         return cleaned
 
     # ----------------------------
@@ -173,33 +194,51 @@ class BugHoundAgent:
     # ----------------------------
     # Parsing + utilities
     # ----------------------------
-    def _parse_json_array_of_issues(self, text: str) -> Optional[List[Dict[str, str]]]:
-        text = text.strip()
+    def _parse_and_validate_issues(self, text: str) -> Tuple[Optional[List[Dict[str, str]]], str]:
+        """
+        Strictly parse + validate the analyzer output.
+
+        Returns (issues, "") on success, or (None, reason) on any problem.
+        The whole response is rejected if ANY item is invalid: a partly
+        malformed answer is a sign we can't trust the rest of it either.
+        """
+        text = (text or "").strip()
+        if not text:
+            return None, "empty response"
+
         parsed = self._try_json_loads(text)
-        if isinstance(parsed, list):
-            return self._normalize_issues(parsed)
+        if not isinstance(parsed, list):
+            array_str = self._extract_first_json_array(text)
+            parsed = self._try_json_loads(array_str) if array_str else None
+        if not isinstance(parsed, list):
+            return None, "not parseable as a JSON array"
 
-        array_str = self._extract_first_json_array(text)
-        if array_str:
-            parsed2 = self._try_json_loads(array_str)
-            if isinstance(parsed2, list):
-                return self._normalize_issues(parsed2)
+        return self._validate_issues(parsed)
 
-        return None
-
-    def _normalize_issues(self, arr: List[Any]) -> List[Dict[str, str]]:
+    def _validate_issues(self, arr: List[Any]) -> Tuple[Optional[List[Dict[str, str]]], str]:
         issues: List[Dict[str, str]] = []
-        for item in arr:
+        for idx, item in enumerate(arr):
             if not isinstance(item, dict):
-                continue
-            issues.append(
-                {
-                    "type": str(item.get("type", "Issue")),
-                    "severity": str(item.get("severity", "Unknown")),
-                    "msg": str(item.get("msg", "")).strip(),
-                }
-            )
-        return issues
+                return None, f"item {idx} is not an object"
+            for field in ("type", "severity", "msg"):
+                if field not in item:
+                    return None, f"item {idx} is missing required field '{field}'"
+                if not isinstance(item[field], str):
+                    return None, f"item {idx} field '{field}' must be a string"
+
+            issue_type = item["type"].strip()
+            severity = item["severity"].strip().capitalize()
+            msg = item["msg"].strip()
+
+            if not issue_type:
+                return None, f"item {idx} has an empty 'type'"
+            if severity not in VALID_SEVERITIES:
+                return None, f"item {idx} has invalid severity '{item['severity']}'"
+            if len(msg) < MIN_MSG_LENGTH:
+                return None, f"item {idx} has an empty or too-short 'msg'"
+
+            issues.append({"type": issue_type, "severity": severity, "msg": msg})
+        return issues, ""
 
     def _try_json_loads(self, s: str) -> Any:
         try:
